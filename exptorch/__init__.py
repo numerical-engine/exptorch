@@ -1,3 +1,5 @@
-from exptorch.algorithm.permutation_importance import PermutationImportanceTable
+from exptorch.algorithm.permutation_importance import PFItable
+from exptorch.algorithm.partial_dependence import PDtable, ICEtable
+from exptorch.algorithm.shap import SHAPtable
 
 __version__ = "0.1.0"
