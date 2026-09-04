@@ -3,7 +3,7 @@ import torch.nn as nn
 from math import factorial
 
 
-def _ishaptable(net:nn.Module|callable, x:torch.Tensor, target_index:int, group:list[tuple[int]|int] = None)->torch.Tensor:
+def _ishaptable(net:nn.Module|callable, x:torch.Tensor, target_index:int, group = None)->torch.Tensor:
     """指定した入力に対するSHAP値の計算。
 
     Args:
@@ -62,15 +62,38 @@ def _ishaptable(net:nn.Module|callable, x:torch.Tensor, target_index:int, group:
     return shap
 
 
-def _ideepshaptable(
-    net: nn.Module | callable,
-    x: torch.Tensor,
-    target_index: int,
-    group: list[tuple[int] | int] = None,
-    reference: torch.Tensor | None = None,
-    baseline: torch.Tensor | None = None,
-    n_steps: int = 50,
-) -> torch.Tensor:
+
+class SHAPtable:
+    """テーブルデータに対するSHAP
+
+    Attributes:
+        net (nn.Module | callable): ネットワークモデルもしくは関数。
+        x (torch.Tensor): 入力データ。shapeは(batch_num, input_dim)。
+        group (list[tuple[int] | int], optional): 入力変数のグループ情報。指定しない場合は各変数が個別グループ。
+        ishap (torch.Tensor | None): 計算されたSHAP値。compute()を呼び出すまでNone。
+    """
+    def __init__(self, net:nn.Module|callable, x: torch.Tensor, group = None):
+        self.net = net
+        self.x = x
+        if group is None:
+            self.group = [(index,) for index in range(x.size(1))]
+        else:
+            self.group = [(item,) if isinstance(item, int) else tuple(item) for item in group]
+
+        self.ishap = None
+
+    def compute(self) -> None:
+        self.ishap = []
+        for t in range(len(self.x)):
+            self.ishap.append(_ishaptable(self.net, self.x, t, self.group))
+        self.ishap = torch.stack(self.ishap, dim=0)
+
+    def shap_macro(self) -> torch.Tensor:
+        if self.ishap is None:
+            raise ValueError("SHAP値が計算されていません。compute()を先に呼び出してください。")
+        return torch.mean(torch.abs(self.ishap), dim=0)
+
+def _ideepshaptable(net:nn.Module|callable, x: torch.Tensor, target_index: int, group = None, reference = None, baseline = None, n_steps: int = 50,) -> torch.Tensor:
     """指定した入力に対するDeepSHAP値の計算。
 
     DeepSHAPでは、背景データを参照セットとして用い、対象入力と参照入力の間を補間しながら
@@ -110,7 +133,7 @@ def _ideepshaptable(
     if sorted(indices) != list(range(x.size(1))):
         raise ValueError("groupは入力変数を重複なくすべて含む必要があります。")
 
-    sample = x[target_index].to(device=x.device, dtype=x.dtype).clone().requires_grad_(True)
+    sample = x[target_index].to(device=x.device, dtype=x.dtype)
     if reference is None:
         mask = torch.arange(x.size(0), device=x.device) != target_index
         reference = x[mask]
@@ -138,41 +161,40 @@ def _ideepshaptable(
     if baseline.size(0) != reference.size(0):
         raise ValueError("referenceとbaselineのサンプル数が一致していません。")
 
-    reference_attr = []
+    # 既定ではbaselineがreferenceの平均1点に潰れて全行が重複するため、一意な行だけをまとめて1回のforward/backwardで処理する。
+    unique_baseline, counts = torch.unique(baseline, dim=0, return_counts=True)
+    n_unique = unique_baseline.size(0)
+    ref_weights = counts.to(dtype=x.dtype) / baseline.size(0)
+
     weights = torch.linspace(0.0, 1.0, steps=n_steps, device=x.device, dtype=x.dtype)
+    diff = sample.unsqueeze(0) - unique_baseline  # (n_unique, input_dim)
 
-    for ref_index, ref in enumerate(reference):
-        base = baseline[ref_index].clone().to(device=x.device, dtype=x.dtype)
-        with torch.enable_grad():
-            path_attr = None
-            for alpha in weights:
-                path_input = base + alpha * (sample - base)
-                output = net(path_input.unsqueeze(0))
-                if not isinstance(output, torch.Tensor):
-                    raise ValueError("netは入力バッチごとにテンソルを返す必要があります。")
-                if output.dim() == 0:
-                    output = output.unsqueeze(0).unsqueeze(0)
-                elif output.dim() == 1:
-                    output = output.unsqueeze(0)
-                if output.size(0) != 1:
-                    raise ValueError("netは1サンプルあたりの出力を返す必要があります。")
+    # (n_unique, n_steps, input_dim) を1本のバッチにまとめてnetを1回だけ呼び出す。
+    path_inputs = unique_baseline.unsqueeze(1) + weights.view(1, n_steps, 1) * diff.unsqueeze(1)
+    path_inputs = path_inputs.reshape(n_unique * n_steps, x.size(1)).clone().requires_grad_(True)
 
-                output_dim = output.size(-1)
-                if path_attr is None:
-                    path_attr = torch.zeros(output_dim, x.size(1), device=x.device, dtype=x.dtype)
+    with torch.enable_grad():
+        output = net(path_inputs)
+        if not isinstance(output, torch.Tensor):
+            raise ValueError("netは入力バッチごとにテンソルを返す必要があります。")
+        if output.dim() == 1:
+            output = output.unsqueeze(-1)
+        if output.size(0) != n_unique * n_steps:
+            raise ValueError("netは1サンプルあたりの出力を返す必要があります。")
 
-                grad_total = torch.zeros(output_dim, x.size(1), device=x.device, dtype=x.dtype)
-                for idx in range(output_dim):
-                    grad = torch.autograd.grad(output[0, idx], path_input, retain_graph=True, allow_unused=False)[0]
-                    grad_total[idx] = grad
+        output_dim = output.size(-1)
+        grad_total = torch.zeros(n_unique * n_steps, output_dim, x.size(1), device=x.device, dtype=x.dtype)
+        for idx in range(output_dim):
+            # 出力次元ごとにバッチ全体をまとめて逆伝播することでautograd呼び出し回数を削減する。
+            grad = torch.autograd.grad(output[:, idx].sum(), path_inputs, retain_graph=(idx < output_dim - 1))[0]
+            grad_total[:, idx, :] = grad
 
-                path_attr += (sample - base).unsqueeze(0) * grad_total
+    grad_total = grad_total.reshape(n_unique, n_steps, output_dim, x.size(1))
+    contrib = diff.unsqueeze(1).unsqueeze(1) * grad_total  # (n_unique, n_steps, output_dim, input_dim)
+    step_mean = contrib.mean(dim=1)  # (n_unique, output_dim, input_dim)
+    attribution = (step_mean * ref_weights.view(n_unique, 1, 1)).sum(dim=0)  # (output_dim, input_dim)
 
-            reference_attr.append(path_attr / n_steps)
-
-    attribution = torch.stack(reference_attr, dim=0).mean(dim=0)
     group_count = len(group)
-    output_dim = attribution.size(0)
     shap = torch.zeros(group_count, output_dim, device=x.device, dtype=x.dtype)
     for group_index, variable_group in enumerate(group):
         shap[group_index] = attribution[:, list(variable_group)].sum(dim=1)
@@ -192,16 +214,7 @@ class DeepSHAPtable:
         n_steps (int): 勾配積分におけるステップ数。デフォルトは50。
         ishap (torch.Tensor): 計算済みのDeepSHAP値。shapeは (sample_num, group_num, output_dim)。
     """
-
-    def __init__(
-        self,
-        net: nn.Module | callable,
-        x: torch.Tensor,
-        group: list[tuple[int] | int] = None,
-        reference: torch.Tensor | None = None,
-        baseline: torch.Tensor | None = None,
-        n_steps: int = 50,
-    ):
+    def __init__(self, net:nn.Module|callable, x: torch.Tensor, group = None, reference = None, baseline = None, n_steps: int = 50,)->None:
         self.net = net
         self.x = x
         self.reference = reference
@@ -234,35 +247,4 @@ class DeepSHAPtable:
     def shap_macro(self) -> torch.Tensor:
         if self.ishap is None:
             raise ValueError("DeepSHAP値が計算されていません。compute()を先に呼び出してください。")
-        return torch.mean(torch.abs(self.ishap), dim=0)
-
-
-class SHAPtable:
-    """Tableデータに対するSHAP値の計算
-
-    Atttributes:
-        net (nn.Module | callable): SHAP値を計算するニューラルネットまたは呼び出し可能オブジェクト
-        x (torch.Tensor): 入力データのテンソル。shapeは (サンプル数, 入力変数の数)
-        group (list[tuple[int] | int], optional): 入力変数のグループ化情報。Noneの場合は各変数が個別のグループとして扱われる。
-        ishap (torch.Tensor): 計算されたSHAP値のテンソル。shapeは(サンプル数, グループ数, 出力次元数)で、compute()呼び出し後に設定される。
-    """
-    def __init__(self, net: nn.Module | callable, x: torch.Tensor, group: list[tuple[int] | int] = None):
-        self.net = net
-        self.x = x
-        if group is None:
-            self.group = [(index,) for index in range(x.size(1))]
-        else:
-            self.group = [(item,) if isinstance(item, int) else tuple(item) for item in group]
-
-        self.ishap = None
-
-    def compute(self) -> None:
-        self.ishap = []
-        for t in range(len(self.x)):
-            self.ishap.append(_ishaptable(self.net, self.x, t, self.group))
-        self.ishap = torch.stack(self.ishap, dim=0)
-
-    def shap_macro(self) -> torch.Tensor:
-        if self.ishap is None:
-            raise ValueError("SHAP値が計算されていません。compute()を先に呼び出してください。")
         return torch.mean(torch.abs(self.ishap), dim=0)
